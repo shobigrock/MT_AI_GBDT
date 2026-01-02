@@ -365,124 +365,170 @@ class MultiTaskDecisionTree:
             return None
 
         X_node = X[indices]
-        gradients_node = None
-        hessians_node = None
-        task_weights = None
-        if gradients_node is None or hessians_node is None:
-            gradients_node = self.split_gradients[indices]
-            hessians_node = self.split_hessians[indices]
+        gradients_node = self.split_gradients[indices]
+        hessians_node = self.split_hessians[indices]
 
-        if self.weighting_strategy == 'ctcvr_subctr_de_norm_gain':
-            self.all_div_nodes += 1
-            ensemble_gradients = gradients_node[:, 1]
-            ensemble_hessians = hessians_node[:, 1]
+        # Dispatch table keeps weighting_strategy-specific branching in dedicated helpers.
+        handlers = {
+            'ctcvr_subctr_de_norm_gain': self._find_split_ctcvr_subctr_de_norm_gain,
+            'adaptive_hybrid': self._find_split_adaptive_hybrid,
+            'ctcvr-subctr': self._find_split_ctcvr_subctr,
+            'mtgbm': self._find_split_mtgbm,
+            'mtgbm-de-norm': self._find_split_mtgbm,
+            'ablation_STGBDT_normalize': self._find_split_ablation_normalize,
+        }
+
+        handler = handlers.get(self.weighting_strategy, self._find_split_default)
+        return handler(X_node, indices, gradients_node, hessians_node)
+
+    def _find_split_ctcvr_subctr_de_norm_gain(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+        self.all_div_nodes += 1
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, gradients[:, 1], hessians[:, 1]
+        )
+
+        if best_gain < self.delta:
             best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+                X_node, gradients[:, 0], hessians[:, 0]
+            )
+            self.change_div_nodes += 1
+
+        if best_gain > 0:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local]
+            }
+        return None
+
+    def _find_split_adaptive_hybrid(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+        raw_gradients_node = self.raw_gradients[indices]
+        prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
+        cvr_gradients = raw_gradients_node[:, 2]
+        valid_cvr_mask = ~np.isnan(cvr_gradients)
+        prop_neg_cvr = np.mean(cvr_gradients[valid_cvr_mask] < 0) if np.any(valid_cvr_mask) else 0.0
+
+        use_ctcvr = prop_neg_ctcvr >= self.threshold_prop_ctcvr
+        use_cvr = prop_neg_cvr >= self.threshold_prop_cvr
+
+        w_ctr = 10.0
+        w_ctcvr = 10.0 if use_ctcvr else 0.0
+        w_cvr = 1.0 if use_cvr else 0.0
+        task_weights = np.array([w_ctr, w_ctcvr, w_cvr])
+
+        ensemble_gradients, ensemble_hessians = self._compute_ensemble_weights_gradients_hessians(
+            gradients, hessians, task_weights
+        )
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, ensemble_gradients, ensemble_hessians
+        )
+
+        if best_gain > 0:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local]
+            }
+        return None
+
+    def _find_split_ctcvr_subctr(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+        raw_gradients_node = self.raw_gradients[indices]
+        prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
+        use_ctcvr = prop_neg_ctcvr >= self.threshold_prop_ctcvr
+        task_weights = np.array([1.0, 10.0 if use_ctcvr else 0.0, 0.0])
+
+        ensemble_gradients, ensemble_hessians = self._compute_ensemble_weights_gradients_hessians(
+            gradients, hessians, task_weights
+        )
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, ensemble_gradients, ensemble_hessians
+        )
+
+        if best_gain > 0:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local]
+            }
+        return None
+
+    def _find_split_mtgbm(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+        task_weights = None
+        if self.n_tasks >= 2:
+            task_weights = np.zeros(self.n_tasks)
+            task_weights[self.selected_task] = 1.0
+
+        ensemble_gradients, ensemble_hessians = self._compute_ensemble_weights_gradients_hessians(
+            gradients, hessians, task_weights
+        )
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, ensemble_gradients, ensemble_hessians
+        )
+
+        if best_gain > 0:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local]
+            }
+        return None
+
+    def _find_split_ablation_normalize(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+        mask = None
+        if gradients.shape[1] == 3:
+            mask = ~np.isnan(gradients)
+        normalized_gradients = self._compute_normalization_weights(gradients, target_mean=0.05, target_std=0.01, mask=mask)
+        normalized_hessians = self._compute_normalization_weights(hessians, target_mean=1.00, target_std=0.1, mask=mask)
+
+        best_gain = 0.0
+        best_feature_idx = None
+        best_threshold = None
+        best_left_indices = None
+        best_right_indices = None
+
+        for task_idx in range(self.n_tasks):
+            task_weights = np.zeros(self.n_tasks)
+            task_weights[task_idx] = 1.0
+            ensemble_gradients = np.sum(normalized_gradients * task_weights, axis=1)
+            ensemble_hessians = np.sum(normalized_hessians * task_weights, axis=1)
+            gain, feature_idx, threshold, left_indices_local, right_indices_local = self._search_best_split(
                 X_node, ensemble_gradients, ensemble_hessians
             )
-            if best_gain < self.delta:
-                ensemble_gradients = gradients_node[:, 0]
-                ensemble_hessians = hessians_node[:, 0]
-                best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
-                    X_node, ensemble_gradients, ensemble_hessians
-                )
-                self.change_div_nodes += 1
-            
+            if gain > best_gain:
+                best_gain = gain
+                best_feature_idx = feature_idx
+                best_threshold = threshold
+                best_left_indices = left_indices_local
+                best_right_indices = right_indices_local
 
-            if best_gain > 0:
-                return {
-                    'gain': best_gain,
-                    'feature_idx': best_feature_idx,
-                    'threshold': best_threshold,
-                    'left_indices': indices[left_indices_local],
-                    'right_indices': indices[right_indices_local]
-                }
-            return None
-        
+        if best_gain > 0:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[best_left_indices],
+                'right_indices': indices[best_right_indices]
+            }
+        return None
+
+    def _find_split_default(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
         if self.n_tasks == 1:
             ensemble_gradients = self.raw_gradients[indices].flatten()
             ensemble_hessians = self.raw_hessians[indices].flatten()
         else:
-            task_weights = None
-            if self.weighting_strategy == 'adaptive_hybrid':
-                raw_gradients_node = self.raw_gradients[indices]
-                prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
-                cvr_gradients = raw_gradients_node[:, 2]
-                valid_cvr_mask = ~np.isnan(cvr_gradients)
-                if np.any(valid_cvr_mask):
-                    prop_neg_cvr = np.mean(cvr_gradients[valid_cvr_mask] < 0)
-                else:
-                    prop_neg_cvr = 0.0
-
-                use_ctcvr = prop_neg_ctcvr >= self.threshold_prop_ctcvr
-                use_cvr = prop_neg_cvr >= self.threshold_prop_cvr
-
-                w_ctr = 10.0
-                w_ctcvr = 10.0 if use_ctcvr else 0.0
-                w_cvr = 1.0 if use_cvr else 0.0
-                task_weights = np.array([w_ctr, w_ctcvr, w_cvr])
-
-                gradients_node = self.split_gradients[indices]
-                hessians_node = self.split_hessians[indices]
-
-            elif self.weighting_strategy == 'ctcvr-subctr':
-                raw_gradients_node = self.raw_gradients[indices]
-                prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
-                use_ctcvr = prop_neg_ctcvr >= self.threshold_prop_ctcvr
-                w_ctr = 1.0
-                w_ctcvr = 10.0 if use_ctcvr else 0.0
-                w_cvr = 0.0
-                task_weights = np.array([w_ctr, w_ctcvr, w_cvr])
-                gradients_node = self.split_gradients[indices]
-                hessians_node = self.split_hessians[indices]
-
-            elif self.weighting_strategy == 'mtgbm' or self.weighting_strategy == 'mtgbm-de-norm':
-                if self.n_tasks >= 2:
-                    task_weights = np.zeros(self.n_tasks)
-                    task_weights[self.selected_task] = 1.0
-                gradients_node = self.split_gradients[indices]
-                hessians_node = self.split_hessians[indices]
-            elif self.weighting_strategy == 'ablation_STGBDT_normalize':
-                gradients_node = self.split_gradients[indices]
-                hessians_node = self.split_hessians[indices]
-                mask = None
-                if gradients_node.shape[1] == 3:
-                    mask = ~np.isnan(gradients_node)
-                normalized_gradients = self._compute_normalization_weights(gradients_node, target_mean=0.05, target_std=0.01, mask=mask)
-                normalized_hessians = self._compute_normalization_weights(hessians_node, target_mean=1.00, target_std=0.1, mask=mask)
-                best_gain = 0.0
-                best_feature_idx = None
-                best_threshold = None
-                best_left_indices = None
-                best_right_indices = None
-                for task_idx in range(self.n_tasks):
-                    task_weights = np.zeros(self.n_tasks)
-                    task_weights[task_idx] = 1.0
-                    ensemble_gradients = np.sum(normalized_gradients * task_weights, axis=1)
-                    ensemble_hessians = np.sum(normalized_hessians * task_weights, axis=1)
-                    gain, feature_idx, threshold, left_indices_local, right_indices_local = self._search_best_split(
-                        X_node, ensemble_gradients, ensemble_hessians
-                    )
-                    if gain > best_gain:
-                        best_gain = gain
-                        best_feature_idx = feature_idx
-                        best_threshold = threshold
-                        best_left_indices = left_indices_local
-                        best_right_indices = right_indices_local
-                if best_gain > 0:
-                    return {
-                        'gain': best_gain,
-                        'feature_idx': best_feature_idx,
-                        'threshold': best_threshold,
-                        'left_indices': indices[best_left_indices],
-                        'right_indices': indices[best_right_indices]
-                    }
-                return None
-            else:
-                gradients_node = self.split_gradients[indices]
-                hessians_node = self.split_hessians[indices]
-
             ensemble_gradients, ensemble_hessians = self._compute_ensemble_weights_gradients_hessians(
-                gradients_node, hessians_node, task_weights
+                gradients, hessians, None
             )
 
         best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
