@@ -1,0 +1,26 @@
+default_mode: standard
+common:
+  embedding_dim: 64
+  mlp_dims: [360, 200, 80]
+  activation: relu
+  dropout_rate: 0.2
+  learning_rate: 0.001
+  batch_size: 256
+  epochs: 100
+  early_stopping_patience: 10
+  validation_split: 0.2
+  loss_weights:
+    ctr: 1.0
+    ctcvr: 1.0
+  random_state: 42
+  verbose: 1
+modes:
+  standard: {}
+  light:
+    mlp_dims: [128, 64, 32]
+    dropout_rate: 0.1
+    epochs: 30
+  deep:
+    mlp_dims: [512, 256, 128, 64]
+    dropout_rate: 0.3
+    epochs: 120

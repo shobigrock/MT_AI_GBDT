@@ -1,0 +1,52 @@
+default_mode: mtgbm
+common:
+  n_estimators: 100
+  learning_rate: 0.1
+  max_depth: 3
+  min_samples_split: 2
+  min_samples_leaf: 1
+  n_tasks: 3
+  subsample: 1.0
+  colsample_bytree: 1.0
+  gradient_weights: null
+  normalize_gradients: false
+  loss: logloss
+  weighting_strategy: mtgbm
+  gain_threshold: 0.1
+  track_split_gains: true
+  is_dynamic_weight: false
+  gamma: 50.0
+  delta: 0.5
+  verbose_logging: false
+  random_state: 42
+  n_folds_oof: 5
+  threshold_prop_ctcvr: 0.5
+  threshold_prop_cvr: 0.5
+modes:
+  mtgbm:
+    weighting_strategy: mtgbm
+  mtgbm_de_norm:
+    weighting_strategy: mtgbm-de-norm
+  mtgbm_ctr_cvr:
+    weighting_strategy: mtgbm-ctr-cvr
+  adaptive_hybrid:
+    weighting_strategy: adaptive_hybrid
+    threshold_prop_ctcvr: 0.5
+    threshold_prop_cvr: 0.5
+    delta: 0.5
+  ctcvr_subctr:
+    weighting_strategy: ctcvr-subctr
+    threshold_prop_ctcvr: 0.5
+  ctcvr_subctr_de_norm_gain:
+    weighting_strategy: ctcvr_subctr_de_norm_gain
+    delta: 0.5
+  ablation_STGBDT_normalize:
+    weighting_strategy: ablation_STGBDT_normalize
+  ordinal:
+    weighting_strategy: ordinal
+    loss: logloss
+    n_tasks: 2
+  single_task_baseline:
+    weighting_strategy: stgbdt_baseline
+    n_tasks: 1
+    loss: logloss
