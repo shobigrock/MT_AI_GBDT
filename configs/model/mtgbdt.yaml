@@ -16,7 +16,7 @@ common:
   track_split_gains: true
   is_dynamic_weight: false
   gamma: 50.0
-  delta: 0.5
+  delta: 0.005
   verbose_logging: false
   random_state: 42
   n_folds_oof: 5
@@ -33,15 +33,20 @@ modes:
     weighting_strategy: adaptive_hybrid
     threshold_prop_ctcvr: 0.5
     threshold_prop_cvr: 0.5
-    delta: 0.5
+    delta: 0.005
   ctcvr_subctr:
     weighting_strategy: ctcvr-subctr
-    threshold_prop_ctcvr: 0.5
+    threshold_prop_ctcvr: 0.005
   ctcvr_subctr_de_norm_gain:
     weighting_strategy: ctcvr_subctr_de_norm_gain
-    delta: 0.5
+    delta: 0.005
   ablation_STGBDT_normalize:
     weighting_strategy: ablation_STGBDT_normalize
+  propose_kai:
+    weighting_strategy: propose_kai
+    kai_alpha: 0.05
+    kai_target_task: 1
+    kai_source_task: 0
   ordinal:
     weighting_strategy: ordinal
     loss: logloss

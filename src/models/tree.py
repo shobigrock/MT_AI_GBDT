@@ -1,4 +1,5 @@
 """Decision tree implementations for MT-GBDT."""
+import math
 import numpy as np
 from typing import Dict, List, Tuple, Union, Optional, Any
 
@@ -57,7 +58,10 @@ class MultiTaskDecisionTree:
                  delta: float = 0.5,
                  random_state: Optional[int] = None,
                  threshold_prop_ctcvr: float = 0.5,
-                 threshold_prop_cvr: float = 0.5):
+                 threshold_prop_cvr: float = 0.5,
+                 kai_alpha: float = 0.05,
+                 kai_target_task: int = 1,
+                 kai_source_task: int = 0):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
@@ -72,11 +76,25 @@ class MultiTaskDecisionTree:
         self.root = None
         self.threshold_prop_ctcvr = threshold_prop_ctcvr
         self.threshold_prop_cvr = threshold_prop_cvr
+        self.kai_alpha = kai_alpha
+        self.kai_target_task = kai_target_task
+        self.kai_source_task = kai_source_task
 
         self.split_gains = []
         self.current_iteration = 0
         self.change_div_nodes = 0
         self.all_div_nodes = 0
+
+        # propose_kai bookkeeping
+        self.kai_switches = 0  # times we fell back to source task
+        self.kai_split_calls = 0  # number of split-evaluation attempts under propose_kai
+
+        # propose bookkeeping (delta-based fallback)
+        self.propose_switches = 0
+        self.propose_split_calls = 0
+
+        # per-split logging
+        self.split_logs: List[Dict[str, Any]] = []
 
         self.node_logs = []
         self.node_counter = 0
@@ -235,6 +253,7 @@ class MultiTaskDecisionTree:
         if is_leaf_node or best_split is None:
             node.is_leaf = True
             node.values = self._calculate_leaf_value(indices)
+            self._log_node_info(node, is_leaf=True)
             return
 
         node.feature_idx = best_split['feature_idx']
@@ -243,6 +262,19 @@ class MultiTaskDecisionTree:
 
         left_indices = best_split['left_indices']
         right_indices = best_split['right_indices']
+
+        # record split log (per-split diagnostics)
+        split_entry = {
+            'depth': node.depth,
+            'information_gain': node.information_gain,
+            'switched': best_split.get('switched', False),
+            'delta': self.delta,
+            'weighting_strategy': self.weighting_strategy,
+            'node_id': node.node_id,
+        }
+        self.split_logs.append(split_entry)
+
+        self._log_node_info(node, is_leaf=False, weight_switched=best_split.get('switched', False))
 
         self.node_counter += 1
         node.left = DecisionTreeNode(node_id=self.node_counter, depth=depth + 1)
@@ -376,13 +408,17 @@ class MultiTaskDecisionTree:
             'mtgbm': self._find_split_mtgbm,
             'mtgbm-de-norm': self._find_split_mtgbm,
             'ablation_STGBDT_normalize': self._find_split_ablation_normalize,
+            'propose': self._find_split_propose,
+            'propose_kai': self._find_split_propose_kai,
         }
 
         handler = handlers.get(self.weighting_strategy, self._find_split_default)
-        return handler(X_node, indices, gradients_node, hessians_node)
+        return handler(X_node, indices, gradients_node, hessians_node, y_true)
 
-    def _find_split_ctcvr_subctr_de_norm_gain(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_ctcvr_subctr_de_norm_gain(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         self.all_div_nodes += 1
+        self.propose_split_calls += 1
+        switched = False
         best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
             X_node, gradients[:, 1], hessians[:, 1]
         )
@@ -392,18 +428,21 @@ class MultiTaskDecisionTree:
                 X_node, gradients[:, 0], hessians[:, 0]
             )
             self.change_div_nodes += 1
+            self.propose_switches += 1
+            switched = True
 
-        if best_gain > 0:
+        if best_gain > self.gain_threshold:
             return {
                 'gain': best_gain,
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[left_indices_local],
-                'right_indices': indices[right_indices_local]
+                'right_indices': indices[right_indices_local],
+                'switched': switched,
             }
         return None
 
-    def _find_split_adaptive_hybrid(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_adaptive_hybrid(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         raw_gradients_node = self.raw_gradients[indices]
         prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
         cvr_gradients = raw_gradients_node[:, 2]
@@ -432,11 +471,12 @@ class MultiTaskDecisionTree:
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[left_indices_local],
-                'right_indices': indices[right_indices_local]
+                'right_indices': indices[right_indices_local],
+                'switched': False,
             }
         return None
 
-    def _find_split_ctcvr_subctr(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_ctcvr_subctr(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         raw_gradients_node = self.raw_gradients[indices]
         prop_neg_ctcvr = np.mean(raw_gradients_node[:, 1] < 0)
         use_ctcvr = prop_neg_ctcvr >= self.threshold_prop_ctcvr
@@ -456,11 +496,12 @@ class MultiTaskDecisionTree:
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[left_indices_local],
-                'right_indices': indices[right_indices_local]
+                'right_indices': indices[right_indices_local],
+                'switched': False,
             }
         return None
 
-    def _find_split_mtgbm(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_mtgbm(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         task_weights = None
         if self.n_tasks >= 2:
             task_weights = np.zeros(self.n_tasks)
@@ -480,11 +521,12 @@ class MultiTaskDecisionTree:
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[left_indices_local],
-                'right_indices': indices[right_indices_local]
+                'right_indices': indices[right_indices_local],
+                'switched': False,
             }
         return None
 
-    def _find_split_ablation_normalize(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_ablation_normalize(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         mask = None
         if gradients.shape[1] == 3:
             mask = ~np.isnan(gradients)
@@ -518,11 +560,44 @@ class MultiTaskDecisionTree:
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[best_left_indices],
-                'right_indices': indices[best_right_indices]
+                'right_indices': indices[best_right_indices],
+                'switched': False,
             }
         return None
 
-    def _find_split_default(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _find_split_propose(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
+        """Delta-gated task switch: try target task, fallback to source if gain is weak."""
+        self.propose_split_calls += 1
+        target_idx = self.kai_target_task
+        source_idx = self.kai_source_task
+
+        def _select_column(arr: np.ndarray, col_idx: int) -> np.ndarray:
+            col = arr[:, col_idx]
+            if np.any(np.isnan(col)):
+                col = np.nan_to_num(col, nan=0.0)
+            return col
+
+        target_grad = _select_column(gradients, target_idx)
+        target_hess = _select_column(hessians, target_idx)
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, target_grad, target_hess
+        )
+
+        if best_gain > self.delta and best_feature_idx is not None:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local],
+                'switched': False,
+            }
+
+        self.propose_switches += 1
+        return self._search_with_source(indices, X_node, gradients, hessians, source_idx, switched=True)
+
+    def _find_split_default(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
         if self.n_tasks == 1:
             ensemble_gradients = self.raw_gradients[indices].flatten()
             ensemble_hessians = self.raw_hessians[indices].flatten()
@@ -541,7 +616,115 @@ class MultiTaskDecisionTree:
                 'feature_idx': best_feature_idx,
                 'threshold': best_threshold,
                 'left_indices': indices[left_indices_local],
-                'right_indices': indices[right_indices_local]
+                'right_indices': indices[right_indices_local],
+                'switched': False,
+            }
+        return None
+
+    def _find_split_propose_kai(self, X_node: np.ndarray, indices: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, y_true: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
+        """Chi-square based dynamic task switching: target (ctcvr) first, otherwise source (ctr)."""
+        self.kai_split_calls += 1
+        target_idx = self.kai_target_task
+        source_idx = self.kai_source_task
+
+        def _select_column(arr: np.ndarray, col_idx: int) -> np.ndarray:
+            col = arr[:, col_idx]
+            if np.any(np.isnan(col)):
+                col = np.nan_to_num(col, nan=0.0)
+            return col
+
+        # Step 1: search with target task only
+        target_grad = _select_column(gradients, target_idx)
+        target_hess = _select_column(hessians, target_idx)
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, target_grad, target_hess
+        )
+
+        if best_gain <= 0 or best_feature_idx is None or y_true is None:
+            # If no viable split or labels unavailable, fallback to source search directly
+            self.kai_switches += 1
+            return self._search_with_source(indices, X_node, gradients, hessians, source_idx)
+
+        # Step 2: chi-square test on the target labels for this split
+        left_idx = indices[left_indices_local]
+        right_idx = indices[right_indices_local]
+        y_target = y_true[:, target_idx]
+
+        # Use counts; if available, weight by raw hessian to reflect sample weights
+        weight_all = self.raw_hessians[:, target_idx] if hasattr(self, 'raw_hessians') else None
+
+        def _weighted_count(mask: np.ndarray, labels: np.ndarray, weights: Optional[np.ndarray]) -> Tuple[float, float]:
+            pos_mask = labels == 1
+            if weights is None:
+                pos = float(np.sum(mask & pos_mask))
+                neg = float(np.sum(mask & (~pos_mask)))
+            else:
+                pos = float(np.sum(weights[mask & pos_mask]))
+                neg = float(np.sum(weights[mask & (~pos_mask)]))
+            return pos, neg
+
+        left_mask = np.zeros_like(y_target, dtype=bool)
+        left_mask[left_idx] = True
+        right_mask = ~left_mask
+
+        left_pos, left_neg = _weighted_count(left_mask, y_target, weight_all)
+        right_pos, right_neg = _weighted_count(right_mask, y_target, weight_all)
+
+        total_pos = left_pos + right_pos
+        total_neg = left_neg + right_neg
+        total = total_pos + total_neg
+
+        def _chi2_pvalue(obs_pos: float, obs_neg: float, total_pos: float, total_neg: float, group_total: float) -> Tuple[float, float]:
+            if total <= 0 or group_total <= 0:
+                return 0.0, 1.0
+            exp_pos = group_total * (total_pos / total)
+            exp_neg = group_total * (total_neg / total)
+            if exp_pos <= 1e-12 or exp_neg <= 1e-12:
+                return 0.0, 1.0
+            chi2 = ((obs_pos - exp_pos) ** 2) / exp_pos + ((obs_neg - exp_neg) ** 2) / exp_neg
+            p_value = math.erfc(math.sqrt(chi2 / 2.0))
+            return chi2, p_value
+
+        chi2_L, p_L = _chi2_pvalue(left_pos, left_neg, total_pos, total_neg, left_pos + left_neg)
+        chi2_R, _ = _chi2_pvalue(right_pos, right_neg, total_pos, total_neg, right_pos + right_neg)
+        chi2 = chi2_L + chi2_R
+        p_value = math.erfc(math.sqrt(chi2 / 2.0)) if total > 0 else 1.0
+
+        if p_value < self.kai_alpha:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': left_idx,
+                'right_indices': right_idx,
+                'switched': False,
+            }
+
+        # Step 3: fallback to source task search
+        self.kai_switches += 1
+        return self._search_with_source(indices, X_node, gradients, hessians, source_idx, switched=True)
+
+    def _search_with_source(self, indices: np.ndarray, X_node: np.ndarray, gradients: np.ndarray, hessians: np.ndarray, source_idx: int, switched: bool = False) -> Optional[Dict[str, Any]]:
+        source_grad = gradients[:, source_idx]
+        source_hess = hessians[:, source_idx]
+        if np.any(np.isnan(source_grad)):
+            source_grad = np.nan_to_num(source_grad, nan=0.0)
+        if np.any(np.isnan(source_hess)):
+            source_hess = np.nan_to_num(source_hess, nan=0.0)
+
+        best_gain, best_feature_idx, best_threshold, left_indices_local, right_indices_local = self._search_best_split(
+            X_node, source_grad, source_hess
+        )
+
+        if best_gain > 0 and best_feature_idx is not None:
+            return {
+                'gain': best_gain,
+                'feature_idx': best_feature_idx,
+                'threshold': best_threshold,
+                'left_indices': indices[left_indices_local],
+                'right_indices': indices[right_indices_local],
+                'switched': switched,
             }
         return None
     
@@ -557,6 +740,7 @@ class MultiTaskDecisionTree:
             'information_gain': node.information_gain if not is_leaf else 0.0,
             'leaf_values': node.values.tolist() if hasattr(node.values, 'tolist') else node.values,
             'weight_switched': weight_switched,
+            'delta': self.delta,
         }
         
         self.node_logs.append(log_entry)

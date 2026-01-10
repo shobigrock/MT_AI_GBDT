@@ -10,8 +10,8 @@ dependencies = [
     "matplotlib>=3.7.0",
     "seaborn>=0.12.0",
     "scikit-learn>=1.2.0",
-    "tensorflow>=2.12.0",  # メモリ制御等の最適化機能で使用
-    "pyyaml>=6.0",  # ハイパーパラメータ設定のYAML読み込み用
+    "tensorflow>=2.12.0", # メモリ制御等の最適化機能で使用
+    "pyyaml>=6.0", # ハイパーパラメータ設定のYAML読み込み用
 ]
 
 [build-system]

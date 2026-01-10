@@ -70,6 +70,9 @@ class MTGBDT(MTGBMBase):
         n_folds_oof: Optional[int] = None,
         threshold_prop_ctcvr: Optional[float] = None,
         threshold_prop_cvr: Optional[float] = None,
+        kai_alpha: Optional[float] = None,
+        kai_target_task: Optional[int] = None,
+        kai_source_task: Optional[int] = None,
         config: Optional[Dict[str, Any]] = None,
         config_mode: Optional[str] = None,
         config_dir: Optional[Union[str, Path]] = None,
@@ -98,6 +101,9 @@ class MTGBDT(MTGBMBase):
             "n_folds_oof": 5,
             "threshold_prop_ctcvr": 0.5,
             "threshold_prop_cvr": 0.5,
+            "kai_alpha": 0.05,
+            "kai_target_task": 1,
+            "kai_source_task": 0,
         }
 
         config_params: Dict[str, Any] = {}
@@ -130,6 +136,9 @@ class MTGBDT(MTGBMBase):
             "n_folds_oof": n_folds_oof,
             "threshold_prop_ctcvr": threshold_prop_ctcvr,
             "threshold_prop_cvr": threshold_prop_cvr,
+            "kai_alpha": kai_alpha,
+            "kai_target_task": kai_target_task,
+            "kai_source_task": kai_source_task,
         }
 
         for key, value in explicit_params.items():
@@ -214,6 +223,9 @@ class MTGBDT(MTGBMBase):
         self.n_folds_oof = resolved["n_folds_oof"]
         self.threshold_prop_ctcvr = resolved["threshold_prop_ctcvr"]
         self.threshold_prop_cvr = resolved["threshold_prop_cvr"]
+        self.kai_alpha = resolved["kai_alpha"]
+        self.kai_target_task = resolved["kai_target_task"]
+        self.kai_source_task = resolved["kai_source_task"]
         
         self.trees_ = []
         self.initial_predictions_ = None
@@ -453,7 +465,10 @@ class MTGBDT(MTGBMBase):
                 delta=self.delta,
                 random_state=self.random_state,
                 threshold_prop_ctcvr=self.threshold_prop_ctcvr,
-                threshold_prop_cvr=self.threshold_prop_cvr
+                threshold_prop_cvr=self.threshold_prop_cvr,
+                kai_alpha=self.kai_alpha,
+                kai_target_task=self.kai_target_task,
+                kai_source_task=self.kai_source_task
             )
 
             tree.fit(
@@ -477,7 +492,36 @@ class MTGBDT(MTGBMBase):
                 loss_name = "LogLoss" if self.loss == "logloss" else "MSE"
                 print(f"Iteration {i+1}/{self.n_estimators}, {loss_name}: {loss_value:.6f}, Time: {elapsed_time:.2f}s")
 
+        # Aggregate training-time bookkeeping (e.g., propose_kai switch counts)
+        self.training_stats_ = self._collect_training_stats()
+
         return self
+
+    def _collect_training_stats(self) -> Dict[str, Any]:
+        stats = {
+            "kai_switches": 0,
+            "kai_split_calls": 0,
+            "propose_switches": 0,
+            "propose_split_calls": 0,
+            "ctcvr_switches": 0,
+            "ctcvr_split_calls": 0,
+            "split_logs": [],
+        }
+        for idx, tree_info in enumerate(self.trees_):
+            tree = tree_info.get("tree")
+            if tree is None:
+                continue
+            stats["kai_switches"] += getattr(tree, "kai_switches", 0)
+            stats["kai_split_calls"] += getattr(tree, "kai_split_calls", 0)
+            stats["propose_switches"] += getattr(tree, "propose_switches", 0)
+            stats["propose_split_calls"] += getattr(tree, "propose_split_calls", 0)
+            stats["ctcvr_switches"] += getattr(tree, "change_div_nodes", 0)
+            stats["ctcvr_split_calls"] += getattr(tree, "all_div_nodes", 0)
+            for entry in getattr(tree, "split_logs", []):
+                copied = dict(entry)
+                copied["tree_index"] = idx
+                stats["split_logs"].append(copied)
+        return stats
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
